@@ -39,10 +39,14 @@ void console(void)
 	getLine(buf, sizeof buf);
 	while(strncmp(buf, "quit", 5) != 0)
 	{
-		if(!strncmp(buf, "kick", 5))
+		if(!strncmp(buf, "kick", 4))
 		{
 			int id = atoi(&buf[5]);
-			if(check_id(clients, id) != 0) {
+
+			if(buf[4] != ' ' || !isdigit(buf[5])) {
+				fputs("Usage: kick [id]\n", stderr);
+			}
+			else if(check_id(clients, id) != 0) {
 				fputs("Invalid id.\n", stderr);
 			}
 			else if(send_message(clients, INFO, "You have been kicked.", 0, id) == 0 &&
@@ -55,7 +59,12 @@ void console(void)
 		}
 		else if(!strncmp(buf, "say", 3))
 		{
-			send_echo(clients, MESSAGE, &buf[4], 0);
+			if(buf[3] != ' ' || !isgraph(buf[4])) {
+				fputs("Usage: say [msg]\n", stderr);
+			}
+			else {
+				send_echo(clients, MESSAGE, &buf[4], 0);
+			}
 		}
 		else if(!strncmp(buf, "clients", 8))
 		{

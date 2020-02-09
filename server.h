@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <time.h>
+#include <ctype.h>
 
 #define CLIENTS_MEM_SZ 1024L   /* data buffer to store clients_t struct and struct client linked list */
 #define MESSAGES_MEM_SZ 1024L  /* data buffer to store struct message linked list */
