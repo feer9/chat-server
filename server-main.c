@@ -53,7 +53,7 @@ void console(void)
 				fprintf(stderr, "Couldn't kick client %d\n", id);
 			}
 		}
-		else if(!strncmp(buf, "say", 4))
+		else if(!strncmp(buf, "say", 3))
 		{
 			send_echo(clients, MESSAGE, &buf[4], 0);
 		}
