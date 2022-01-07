@@ -13,8 +13,10 @@ int main(int argc, char *argv[])
 	if(argc == 2 && atoi(argv[1]) > 0)
 		strncpy(port, argv[1], 7);
 
-	clients = (clients_t*) create_shared_memory(CLIENTS_MEM_SZ);
-	clients->message_mem = create_shared_memory(MESSAGES_MEM_SZ);
+	if( (clients = (clients_t*) create_shared_memory(CLIENTS_MEM_SZ) ) == MAP_FAILED )
+		exit(1);
+	if( (clients->message_mem = create_shared_memory(MESSAGES_MEM_SZ)) == MAP_FAILED )
+		exit(1);
 	clients->cnt = 0;
 	clients->chead = NULL;
 	clients->time_up = time(NULL);
@@ -501,7 +503,9 @@ void remove_client(clients_t *clients, int id)
 
 size_t getLine(char *buf, int buf_sz)
 {
-	fgets(buf, buf_sz, stdin);
+	if (fgets(buf, buf_sz, stdin) == NULL)
+		exit(0);
+
 	size_t len = strlen(buf);
 	if(len>0)
 		buf[--len] = '\0';
