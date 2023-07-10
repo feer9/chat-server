@@ -1,2 +1,5 @@
 ## exclude binary file
 server
+
+## exclude QT user file
+server.pro.user

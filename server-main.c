@@ -33,6 +33,8 @@ int main(int argc, char *argv[])
 	exit(0);
 }
 
+// Here I define the list of available commands, which then generates
+// an enum of the form cmd_<commandname> and a string "<commandname>"
 #define COMMAND_LIST(CMD)	\
 	CMD(quit)				\
 	CMD(kick)				\
@@ -85,23 +87,24 @@ static command_t* readCmd(void)
 	char c;
 
 	getLine(buf, sizeof buf);
+	// split command from argument
 	while ( cmd_len < (int) sizeof buf &&
-	        (c = buf[cmd_len]) != '\0' && !isspace(c) )
+	        (c = buf[cmd_len]) != '\0' && !isspace(c) ) {
 		cmd_len++;
+	}
 	buf[cmd_len] = '\0';
-//	sscanf(buf, "%s%n", buf, &cmd_len);
 
 	// get command ID
 	input_cmd.str = buf;
 	input_cmd.arg = NULL;
 	command_t *cmd_ptr = bsearch(&input_cmd, commands, cmd_MAX, sizeof *commands, compare_cmd);
 
-	if(cmd_ptr) {
+	if(cmd_ptr) { // command found
 		cmd_ptr->arg = buf + cmd_len + 1;
 		while(cmd_ptr->arg - buf < (int) sizeof buf && isspace(*cmd_ptr->arg))
 			cmd_ptr->arg++;
 	}
-	else {
+	else { // invalid command
 		input_cmd.id = cmd_MAX;
 		cmd_ptr = &input_cmd;
 	}
