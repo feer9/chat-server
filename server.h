@@ -1,6 +1,7 @@
 #ifndef SERVER_H
 #define SERVER_H
 
+#define __STDC_WANT_LIB_EXT1__ 1
 #include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,10 @@ typedef struct {
 	struct message *mhead;
 } clients_t; // sz 40
 
+
+#define GENERATE_ENUM(ENUM) cmd_##ENUM,
+#define GENERATE_STRING(STRING) #STRING,
+
 #define MIN(a,b) ((a<b) ? a : b)
 
 #define MAX_CLIENTS MIN(((CLIENTS_MEM_SZ-sizeof(clients_t)) / sizeof(struct client) - 1) , \
@@ -79,7 +84,7 @@ void *thread_listen(void *data);
 void print_commands_help(void);
 static void sigusr1_handler(int signal, siginfo_t *info, void *ucontext);
 static void dummy_handler(int s);
-int send_echo(clients_t *clients, msg_type_t concept, char *buf, int sender_id);
+int send_echo(clients_t *clients, msg_type_t concept, const char *buf, int sender_id);
 int send_message(clients_t *clients, msg_type_t concept, char *buf, int sender_id, int dest_id);
 void pop_msg(clients_t *clients, int sender_id);
 struct message *push_msg(clients_t *clients, char *buf, size_t len, int sender_id, int echos);

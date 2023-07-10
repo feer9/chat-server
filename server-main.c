@@ -7,7 +7,6 @@ static int cfd = -1; // client socket file descriptor
 static int cid = -1; // client associated ID
 static char port[8] = PORT_STR;
 
-
 int main(int argc, char *argv[])
 {
 	if(argc == 2 && atoi(argv[1]) > 0)
@@ -34,68 +33,159 @@ int main(int argc, char *argv[])
 	exit(0);
 }
 
-void console(void)
+#define COMMAND_LIST(CMD)	\
+	CMD(quit)				\
+	CMD(kick)				\
+	CMD(say)				\
+	CMD(clients)			\
+	CMD(uptime)				\
+	CMD(stats)				\
+	CMD(status)				\
+	CMD(help)				\
+	CMD(info)
+
+typedef enum {
+	COMMAND_LIST(GENERATE_ENUM)
+	cmd_MAX
+} commands_e;
+
+static const char *commands_string[] = {
+    COMMAND_LIST(GENERATE_STRING)
+};
+
+typedef struct {
+	commands_e id;
+	const char *str;
+	const char *arg;
+} command_t;
+
+int compare_cmd(const void *a, const void *b)
 {
-	char buf[64] = "";
+	return strcmp(((command_t *) a)->str, ((command_t *) b)->str);
+}
+
+static void init_commands(command_t *commands)
+{
+	for(commands_e i=0; i<cmd_MAX; i++)
+	{
+		commands[i].id = i;
+		commands[i].str = commands_string[i];
+		commands[i].arg = 0;
+	}
+	qsort(commands, cmd_MAX, sizeof *commands, compare_cmd);
+}
+
+static command_t commands[cmd_MAX];
+
+static command_t* readCmd(void)
+{
+	static char buf[64] = "";
+	static command_t input_cmd;
+	int cmd_len=0;
+	char c;
 
 	getLine(buf, sizeof buf);
-	while(strncmp(buf, "quit", 5) != 0)
-	{
-		if(!strncmp(buf, "kick", 4))
-		{
-			int id = atoi(&buf[5]);
+	while ( cmd_len < (int) sizeof buf &&
+	        (c = buf[cmd_len]) != '\0' && !isspace(c) )
+		cmd_len++;
+	buf[cmd_len] = '\0';
+//	sscanf(buf, "%s%n", buf, &cmd_len);
 
-			if(buf[4] != ' ' || !isdigit(buf[5])) {
-				fputs("Usage: kick [id]\n", stderr);
-			}
-			else if(check_id(clients, id) != 0) {
-				fputs("Invalid id.\n", stderr);
-			}
-			else if(send_message(clients, INFO, "You have been kicked.", 0, id) == 0 &&
-					kick_client(clients, id) == 0) {
-				puts("Client kicked.");
-			}
-			else {
-				fprintf(stderr, "Couldn't kick client %d\n", id);
-			}
-		}
-		else if(!strncmp(buf, "say", 3))
+	// get command ID
+	input_cmd.str = buf;
+	input_cmd.arg = NULL;
+	command_t *cmd_ptr = bsearch(&input_cmd, commands, cmd_MAX, sizeof *commands, compare_cmd);
+
+	if(cmd_ptr) {
+		cmd_ptr->arg = buf + cmd_len + 1;
+		while(cmd_ptr->arg - buf < (int) sizeof buf && isspace(*cmd_ptr->arg))
+			cmd_ptr->arg++;
+	}
+	else {
+		input_cmd.id = cmd_MAX;
+		cmd_ptr = &input_cmd;
+	}
+
+	return cmd_ptr;
+}
+
+void console(void)
+{
+	init_commands(commands);
+
+	while(1)
+	{
+		command_t *cmd = readCmd();
+
+		switch(cmd->id)
 		{
-			if(buf[3] != ' ' || !isgraph(buf[4])) {
+		case cmd_quit:
+		    goto quit;
+		    break;
+
+		case cmd_kick:
+		    {
+			    int player_id = atoi(cmd->arg);
+
+				if(!isdigit(cmd->arg[0])) {
+					fputs("Usage: kick [id]\n", stderr);
+				}
+				else if(check_id(clients, player_id) != 0) {
+					fputs("Invalid id.\n", stderr);
+				}
+				else if(send_message(clients, INFO, "You have been kicked.",
+				                     0, player_id) == 0
+				        && kick_client(clients, player_id) == 0) {
+					puts("Client kicked.");
+				}
+				else {
+					fprintf(stderr, "Couldn't kick client %d\n", player_id);
+				}
+		    }
+		    break;
+
+		case cmd_say:
+		    if(!isgraph(cmd->arg[0])) {
 				fputs("Usage: say [msg]\n", stderr);
 			}
 			else {
-				send_echo(clients, MESSAGE, &buf[4], 0);
+				send_echo(clients, MESSAGE, cmd->arg, 0);
 			}
-		}
-		else if(!strncmp(buf, "clients", 8))
-		{
+		    break;
+
+		case cmd_clients:
+		    print_clients(clients);
+		    break;
+
+		case cmd_uptime:
+		    printf("Uptime: %lds\n", time(NULL) - clients->time_up);
+		    break;
+
+		case cmd_stats:
+		case cmd_status:
+		    printf("Uptime: %lds\n", time(NULL) - clients->time_up);
 			print_clients(clients);
-		}
-		else if(!strncmp(buf, "uptime", 7))
-		{
-			printf("Uptime: %lds\n", time(NULL) - clients->time_up);
-		}
-		else if(!strncmp(buf, "status", 7) || !strncmp(buf, "stats", 6))
-		{
-			printf("Uptime: %lds\n", time(NULL) - clients->time_up);
-			print_clients(clients);
-		}
-		else if(!strncmp(buf, "help", 5))
-		{
-			print_commands_help();
-		}
-		else if(!strncmp(buf, "info", 5))
-		{
-			printf("Server is running on port %s\n", port);
+		    break;
+
+		case cmd_help:
+		    print_commands_help();
+		    break;
+
+		case cmd_info:
+		    printf("Server is running on port %s\n", port);
 			printf("Max allowed clients are: %ld\n", MAX_CLIENTS);
+		    break;
+
+		case cmd_MAX:
+		    if(cmd->str && *cmd->str)
+				printf("Unknown command \"%s\". "
+				       "Type \"help\" to view a full command list.\n",
+				       cmd->str);
+		    break;
 		}
-		else {
-			printf("Unknown command \"%s\". Type \"help\" to view a full command list.\n", buf);
-		}
-		getLine(buf, sizeof buf);
 	}
 
+    quit:
 	send_echo(clients, INFO, "Server is shutting down...", 0);
 }
 
@@ -403,13 +493,13 @@ char *get_ip_str(const struct sockaddr *sa, char *s, socklen_t maxlen)
 {
 	switch(sa->sa_family) {
 		case AF_INET:
-			inet_ntop(AF_INET, &(((const struct sockaddr_in *)sa)->sin_addr),
-					s, maxlen);
+	        inet_ntop(AF_INET, &(((const struct sockaddr_in *)sa)->sin_addr)
+			          , s, maxlen);
 			break;
 
 		case AF_INET6:
-			inet_ntop(AF_INET6, &(((const struct sockaddr_in6 *)sa)->sin6_addr),
-					s, maxlen);
+	        inet_ntop(AF_INET6, &(((const struct sockaddr_in6 *)sa)->sin6_addr)
+			          , s, maxlen);
 			break;
 
 		default:
@@ -507,8 +597,17 @@ size_t getLine(char *buf, int buf_sz)
 		exit(0);
 
 	size_t len = strlen(buf);
-	if(len>0)
+	if(len>0) {
 		buf[--len] = '\0';
+
+		if((int)len == buf_sz-1) {
+			// Input bigger than buffer. Clean stdin
+			int c;
+			do {
+				c = getchar();
+			} while (c != '\n' && c != EOF);
+		}
+	}
 
 	return len;
 }
@@ -636,7 +735,7 @@ int send_message(clients_t *clients, msg_type_t concept, char *msg, int sender_i
 	return ret;
 }
 
-int send_echo(clients_t *clients, msg_type_t concept, char *msg, int sender_id)
+int send_echo(clients_t *clients, msg_type_t concept, const char *msg, int sender_id)
 {
 	struct client *chead = clients->chead;
 	char *buf = ((char*)clients->message_mem) + MESSAGES_BUF_MEM;
