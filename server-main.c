@@ -1,37 +1,43 @@
 #include "server.h"
 
-static clients_t *clients;
+static char port[8] = PORT_STR;
 
 // each process data:
-static int sockfd = -1; // parent socket file descriptor
-static int cfd = -1;    // client socket file descriptor
-static int cid = -1;    // client associated ID
-static SSL_CTX *ssl_ctx = NULL;
-static SSL     *ssl     = NULL;
-static char port[8] = PORT_STR;
+static struct process_data pdata = {
+		.pid = -1,
+		.cid = -1,
+		.sockfd = -1,
+		.ssl_ctx = NULL,
+		.ssl = NULL
+};
+static volatile sig_atomic_t sigchld_received = 0;
+static volatile sig_atomic_t sigpipe_received = 0;
 
 int main(int argc, char *argv[])
 {
+	static sdata_t *sdata;
 	if(argc == 2 && atoi(argv[1]) > 0)
 		strncpy(port, argv[1], 7);
 
-	if((clients = (clients_t*) create_shared_memory(CLIENTS_MEM_SZ) ) == MAP_FAILED)
+	if((sdata = (sdata_t*) create_shared_memory(CLIENTS_MEM_SZ) ) == MAP_FAILED)
 		exit(1);
-	if((clients->message_mem = create_shared_memory(MESSAGES_MEM_SZ)) == MAP_FAILED)
+	if((sdata->message_mem = create_shared_memory(MESSAGES_MEM_SZ)) == MAP_FAILED)
 		exit(1);
-	clients->cnt = 0;
-	clients->chead = NULL;
-	clients->time_up = time(NULL);
+	sdata->clients_cnt = 0;
+	sdata->chead = NULL;
+	sdata->mhead = NULL;
+	sdata->time_up = time(NULL);
 
-	cid = 0; // server id = 0
+	pdata.pid = getpid();
+	pdata.cid = 0;  // server id = 0
 
-	set_signals();
+	set_signals(sdata);
 
 	pthread_t thread_id;
-	pthread_create(&thread_id, NULL, thread_listen, NULL);
+	pthread_create(&thread_id, NULL, thread_listen, sdata);
 	pthread_detach(thread_id);
 
-	console();
+	console(sdata);
 
 	exit(0);
 }
@@ -51,11 +57,13 @@ int main(int argc, char *argv[])
 
 typedef enum {
 	COMMAND_LIST(GENERATE_ENUM)
+	cmd_CONTINUE,
 	cmd_MAX
 } commands_e;
 
 static const char *commands_string[] = {
     COMMAND_LIST(GENERATE_STRING)
+	"", /* cmd_CONTINUE */
 };
 
 typedef struct {
@@ -82,14 +90,19 @@ static void init_commands(command_t *commands)
 
 static command_t commands[cmd_MAX];
 
-static command_t* readCmd(void)
+static command_t* readCmd(sdata_t *sdata)
 {
 	static char buf[64] = "";
 	static command_t input_cmd;
 	int cmd_len=0;
 	char c;
 
-	getLine(buf, sizeof buf);
+	size_t readsz = getLine(buf, sizeof buf);
+	if(readsz == 0) {
+		handle_readerr(sdata);
+		input_cmd.id = cmd_CONTINUE;
+		return &input_cmd;
+	}
 	// split command from argument
 	while ( cmd_len < (int) sizeof buf &&
 	        (c = buf[cmd_len]) != '\0' && !isspace(c) ) {
@@ -116,45 +129,63 @@ static command_t* readCmd(void)
 	return cmd_ptr;
 }
 
-void console(void)
+void handle_readerr(sdata_t *sdata)
+{
+	if(errno == EINTR) {
+		if(sigchld_received) {
+			dbg_print("received sigchld in getLine()\n");
+			sigchld_received--;
+			wait_for_child(sdata);
+			return;
+		}
+		if(sigpipe_received) {
+			dbg_print("received sigpipe in getLine()\n");
+			sigpipe_received = 0;
+			report_socket_down(sdata);
+			exit(1);
+		}
+	}
+	exit(0);
+}
+
+void console(sdata_t *sdata)
 {
 	init_commands(commands);
 
 	while(1)
 	{
-		command_t *cmd = readCmd();
+		command_t *cmd = readCmd(sdata);
 
 		switch(cmd->id)
 		{
 		case cmd_quit:
 		    goto quit;
-		    break;
 
 		case cmd_kick:
-			cmd_KickUser_s(cmd->arg);
+			cmd_KickUser_s(sdata, cmd->arg);
 		    break;
 
 		case cmd_say:
-		    if(!isgraph(cmd->arg[0])) {
+			if(!isgraph(cmd->arg[0])) {
 				fputs("Usage: say [msg]\n", stderr);
 			}
 			else {
-				send_echo(clients, MESSAGE, cmd->arg, 0);
+				send_echo(sdata, MESSAGE, cmd->arg, 0);
 			}
 		    break;
 
 		case cmd_clients:
-		    print_clients(clients);
+		    print_clients(sdata);
 		    break;
 
 		case cmd_uptime:
-			print_uptime();
+			print_uptime(sdata);
 			break;
 
 		case cmd_stats:
 		case cmd_status:
-			print_uptime();
-			print_clients(clients);
+			print_uptime(sdata);
+			print_clients(sdata);
 			break;
 
 		case cmd_help:
@@ -167,6 +198,9 @@ void console(void)
 			printf("Max allowed clients are: %ld\n", MAX_CLIENTS);
 			break;
 
+		case cmd_CONTINUE:
+			continue;
+
 		case cmd_MAX:
 		    if(cmd->str && *cmd->str)
 				printf("Unknown command \"%s\". "
@@ -177,17 +211,17 @@ void console(void)
 	}
 
     quit:
-	send_echo(clients, INFO, "Server is shutting down...", 0);
+	send_echo(sdata, INFO, "Server is shutting down...", 0);
 }
 
-int cmd_KickUser(int user_id)
+int cmd_KickUser(sdata_t *sdata, int user_id)
 {
-	if(check_id(clients, user_id) != 0) {
-		fputs("Invalid id.\n", stderr);
+	if(check_id(sdata, user_id) != 0) {
+		fputs("Invalid cid.\n", stderr);
 		return -2;
 	}
-	else if(send_message(clients, INFO, "You have been kicked.",0, user_id) == 0
-			&& kick_client(clients, user_id) == 0) {
+	else if(send_message(sdata, INFO, "You have been kicked.", 0, user_id) == 0
+			&& kick_client(sdata, user_id) == 0) {
 		puts("Client kicked.");
 		return 0;
 	}
@@ -197,22 +231,22 @@ int cmd_KickUser(int user_id)
 	}
 }
 
-int cmd_KickUser_s(const char *id_str)
+int cmd_KickUser_s(sdata_t *sdata, const char *id_str)
 {
-	int user_id = atoi(id_str);
+	int user_id = atoi(id_str); // TODO: replace with strtol()
 
 	if(!isdigit(id_str[0])) {
-		fputs("Usage: kick [id]\n", stderr);
+		fputs("Usage: kick [cid]\n", stderr);
 		return -1;
 	}
-	else return cmd_KickUser(user_id);
+	else return cmd_KickUser(sdata, user_id);
 }
 
-void *thread_listen(void *data)
+void *thread_listen(void *data) // TODO: split into functions
 {
-	(void)data;
+	sdata_t *sdata = data;
 	int clientfd=-1;
-	char *buf = ((char*)clients->message_mem) + MESSAGES_BUF_MEM;
+	char *buf = ((char*)sdata->message_mem) + MESSAGES_BUF_MEM;
 	ssize_t nbytes;
 	sigset_t set;
 
@@ -227,7 +261,7 @@ void *thread_listen(void *data)
 		exit(1);
 	}
 
-	sockfd = create_socket();
+	int sockfd = create_socket();
 
 	while(1)
 	{
@@ -252,14 +286,18 @@ void *thread_listen(void *data)
 				exit(1);
 			}
 
-			close(sockfd);  // close parent's socket
-			sockfd = -1;
-			cfd = clientfd; // set client socket to global var
+			close(sockfd);     // close parent's socket
+			// TODO: debería cerrar el ssl_ctx del padre acá?
 
-			ssl = SSL_new(ssl_ctx);
-			SSL_set_fd(ssl, clientfd);
+			// set client data to its own process global structure
+			pdata.sockfd = clientfd;
+			pdata.pid = getpid();
+			pdata.time_join = time(NULL);
 
-			if (SSL_accept(ssl) <= 0) {
+			pdata.ssl = SSL_new(pdata.ssl_ctx);
+			SSL_set_fd(pdata.ssl, clientfd);
+
+			if (SSL_accept(pdata.ssl) <= 0) {
 				ERR_print_errors_fp(stderr);
 				exit(1);
 			}
@@ -267,46 +305,60 @@ void *thread_listen(void *data)
 				printf("SSL connection established.\n");
 			}
 
-			if(add_client(clients, cfd, getpid()) == -1)
+			int cid = add_client(sdata, &pdata);
+			if(cid == -1)
 			{
 				fputs("Max clients reached. Can't add more.\n", stderr);
 				strcpy(buf, "Server is full.");
-				if (SSL_write(ssl, buf, strlen(buf)+1) == -1)
+				if (SSL_write(pdata.ssl, buf, (int) strlen(buf)+1) == -1)
 					perror("SSL_write");
 				exit(1);
 			}
+			pdata.cid = cid; // set client ID to its process global structure
 
 			printf("Client %d connected.\n", cid);
 
 			strcpy(buf, WELCOME_MSG);
 			sprintf(&buf[sizeof(WELCOME_MSG)-1], " Your id is: %d", cid);
-			if (SSL_write(ssl, buf, strlen(buf)+1) == -1) {
+			if (SSL_write(pdata.ssl, buf, (int) strlen(buf)+1) == -1) {
 				perror("SSL_write");
 				exit(1);
 			}
 
 			sprintf(buf, "Client %d connected from \"%s\".", cid, addr_str);
-			send_echo(clients, INFO, buf, cid);
+			send_echo(sdata, INFO, buf, cid);
 
 			for(;;)
 			{
-				nbytes = SSL_read(ssl, buf, MESSAGES_BUF_SZ);
-				if(nbytes == -1) {
-					perror("SSL_read");
-					break;
-				}
-				else if(nbytes == 0) {
-					dbg_print("SSL_read return 0\n");
-					SSL_shutdown(ssl);
-					break;
+				nbytes = SSL_read(pdata.ssl, buf, MESSAGES_BUF_SZ);
+				if(nbytes <= 0) {
+					int e = SSL_get_error(pdata.ssl, nbytes);
+					if(e == SSL_ERROR_SYSCALL) {
+						if(sigpipe_received){
+							sigpipe_received = 0;
+							dbg_print("received sigpipe from client %d.\n", cid);
+							break;
+						}
+						continue;
+					}
+					else if(e == SSL_ERROR_ZERO_RETURN){
+						dbg_print("SSL_read return 0\n");
+						SSL_shutdown(pdata.ssl);
+						break;
+					}
+					else {
+						perror("SSL_read"); /* ERR_print_errors_fp(stderr); */
+						break;
+					}
 				}
 				printf("Client %d-> %s\n", cid, buf);
 
-				send_echo(clients, MESSAGE, buf, cid);
+				send_echo(sdata, MESSAGE, buf, cid);
 			}
 
-			close(cfd);
-			socket_disconnected(SIGPIPE);
+			close(clientfd);
+			report_socket_down(sdata);
+			exit(0);
 		}
 		else if(pid > 0) // parent
 		{
@@ -325,8 +377,8 @@ int create_socket(void)
 	int sockfd=-1;
 
     initialize_openssl();
-    ssl_ctx = create_ssl_context();
-    configure_ssl_context(ssl_ctx);
+    pdata.ssl_ctx = create_ssl_context();
+    configure_ssl_context(pdata.ssl_ctx);
 
 	memset(&hints, 0, sizeof (struct addrinfo));
 	hints.ai_family = AF_UNSPEC;
@@ -355,7 +407,7 @@ int create_socket(void)
 
 		close(sockfd);
 	}
-	if(rp == NULL) { // no address socceeded
+	if(rp == NULL) { // no address succeeded
 		fprintf(stderr, "Could not bind\n");
 		exit(1);
 	}
@@ -368,6 +420,7 @@ int create_socket(void)
 		exit(1);
 	}
 
+	pdata.sockfd = sockfd;
 	puts("Waiting for conections...");
 
 	return sockfd;
@@ -381,33 +434,40 @@ static void set_signal_handler(int signum, const struct sigaction *sa)
 	}
 }
 
-void set_signals(void)
+void set_signals(sdata_t *sdata)
 {
 	struct sigaction sa;
 	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
-	
-	sa.sa_handler = socket_disconnected;
+	sa.sa_flags = 0;
+
+	sa.sa_handler = sigpipe_handler;
 	set_signal_handler(SIGPIPE, &sa);
-	
+
+	sa.sa_handler = sigchld_handler;
+	set_signal_handler(SIGCHLD, &sa);
+
+	sa.sa_flags |= SA_RESTART;
 	sa.sa_handler = exit_program;
 	set_signal_handler(SIGTERM, &sa);
 	set_signal_handler(SIGINT, &sa);
 
-	sa.sa_handler = sigchld_handler;
-	set_signal_handler(SIGCHLD, &sa);
-	
 	sa.sa_handler = dummy_handler;
 	sa.sa_flags |= SA_NODEFER;
+	/* Do not add the signal to the thread's signal mask  while the handler  is
+	 * executing, unless the signal is specified in act.sa_mask.  Consequently,
+     * a  further  instance  of the signal may be delivered to the thread while
+     * it is executing the handler.
+     */
 	set_signal_handler(SIGCONT, &sa);
-	
+
 	sa.sa_flags |= SA_SIGINFO;
+	/* TODO: Check the usage of SA_NODEFER flag here, it may be wrong */
 	sa.sa_sigaction = &sigusr1_handler;
 	set_signal_handler(SIGUSR1, &sa);
-	
-	atexit(unmap_mem);           // 3°
-	atexit(close_connections);   // 2°
-	atexit(terminate_childrens); // 1°
+
+	on_exit(unmap_mem, sdata);           // 3°
+	on_exit(close_connections, sdata);   // 2°
+	on_exit(terminate_children, sdata);  // 1°
 }
 
 void* create_shared_memory(size_t size) {
@@ -424,17 +484,18 @@ void* create_shared_memory(size_t size) {
   return mmap(NULL, size, protection, visibility, -1, 0);
 }
 
-void unmap_mem(void)
+void unmap_mem(int status, void* data)
 {
-	if(cid == 0) // only parent executes this code
+	sdata_t *sdata = data;
+	if(pdata.cid == 0) // only parent executes this code
 	{
 		write(1, "Unmapping shared memory...", 26);
-		if(clients) {
-			if(clients->message_mem) {
-				munmap(clients->message_mem, MESSAGES_MEM_SZ);
+		if(sdata) {
+			if(sdata->message_mem) {
+				munmap(sdata->message_mem, MESSAGES_MEM_SZ);
 			}
-			munmap(clients, CLIENTS_MEM_SZ);
-			clients = NULL;
+			munmap(sdata, CLIENTS_MEM_SZ);
+			sdata = NULL;
 		}
 		write(1," done.\n", 7);
 	}
@@ -443,68 +504,86 @@ void unmap_mem(void)
 static void sigchld_handler(int signal)
 {
 	(void) signal;
-	pid_t terminated_pid = wait(NULL);
-	
-	if(terminated_pid > 0) {
-		int id = get_id_by_pid(clients, terminated_pid);
-		dbg_print("in sigchld_handler(%d): removing client %d\n", signal, id);
-		remove_client(clients, id);
-	}
-	else {
-		perror("wait");
-		_exit(1);
-	}
+//	wait_for_child(sdata);
+	sigchld_received++;
 }
 
-__attribute__((__noreturn__))
-void socket_disconnected(int signal)
+//__attribute__((__noreturn__))
+static void sigpipe_handler(int signal)
 {
-	if(signal == SIGPIPE)
-	{
-		char* buf = (char*) clients->message_mem + MESSAGES_BUF_MEM;
-		sprintf(buf, "Client %d disconnected.", cid);
-
-		puts(buf);
-		send_echo(clients, INFO, buf, cid);
-	}
-	exit(0);
+	(void)signal;
+	sigpipe_received=1;
+//	report_socket_down(sdata);
+//	exit(0);
 }
 
-void close_connections(void)
+void close_connections(int status, void* data)
 {
-	if(cid == 0) // parent
+//	sdata_t *sdata = data; // server data
+	struct process_data *p = &pdata; // process data
+
+	if(pdata.cid == 0) // parent
 	{
-		if(sockfd != -1) { // 3
-			close(sockfd);
-			sockfd = -1;
+		if(p->sockfd != -1) { // 3
+			close(p->sockfd);
+			p->sockfd = -1;
 		}
 	}
 	else // childrens
 	{
-		if(ssl != NULL) { // 1
-			if(SSL_shutdown(ssl) == 0){
+		if(p->ssl != NULL) { // 1
+			if(SSL_shutdown(p->ssl) == 0){
 			//	shutdown(sockfd, SHUT_WR);
 				sleep_ms(50);
-				SSL_shutdown(ssl);
+				SSL_shutdown(p->ssl);
 			}
-			SSL_free(ssl);
-			ssl = NULL;
+			SSL_free(p->ssl);
+			p->ssl = NULL;
 		}
-		if(cfd != -1) { // 2
-			close(cfd);
-			cfd = -1;
+		if(p->sockfd != -1) { // 2
+			close(p->sockfd);
+			p->sockfd = -1;
 		}
-		if(ssl_ctx != NULL) { // 4
-			SSL_CTX_free(ssl_ctx);
-			ssl_ctx = NULL;
+		if(p->ssl_ctx != NULL) { // 4
+			SSL_CTX_free(p->ssl_ctx);
+			p->ssl_ctx = NULL;
 		}
 		cleanup_openssl();
 	}
+	// TODO: no tendrían que ejecutar todos lo mismo? creo q el parent también tiene un SSL_CTX
 }
 
-void terminate_childrens(void)
+void report_socket_down(sdata_t *sdata)
 {
-	if(cid == 0) // only parent executes this code
+	int client_id = pdata.cid;
+	char* buf = (char*) sdata->message_mem + MESSAGES_BUF_MEM;
+	sprintf(buf, "Client %d disconnected.", client_id);
+
+	puts(buf);
+	send_echo(sdata, INFO, buf, client_id);
+}
+
+void wait_for_child(sdata_t *sdata)
+{
+	pid_t terminated_pid = wait(NULL);
+
+	if(terminated_pid > 0) {
+		int id = get_id_by_pid(sdata, terminated_pid);
+		dbg_print("in wait_for_child(): removing client %d\n", id);
+		remove_client(sdata, id);
+	}
+	else {
+		perror("wait");
+		exit(1); // is it an error? TODO: test with SIGSTOP
+	}
+}
+
+void terminate_children(int status, void* data)
+{
+	sdata_t *sdata = data; // server data
+	struct process_data *p = &pdata; // process data
+
+	if(p->cid == 0) // only parent executes this code
 	{
 		write(1,"Terminating all child processes...", 34);
 
@@ -516,11 +595,11 @@ void terminate_childrens(void)
 
 		// Signal all children to terminate
 		struct client *chead;
-		for(chead = clients->chead; chead != NULL; chead = chead->next)
-			kill(chead->pid, SIGTERM);
+		for(chead = sdata->chead; chead != NULL; chead = chead->next)
+			kill(chead->pdata->pid, SIGTERM);
 
 		// Wait for all children termination
-		while(clients->chead != NULL) {
+		while(sdata->chead != NULL) {
 			sigchld_handler(0);
 		}
 		write(1, " done.\n", 7);
@@ -532,13 +611,13 @@ void exit_program(int signal)
 {
 	(void)signal; // may be SIGTERM or SIGINT
 
-	exit(0); // calling exit(0) produces further calls to 
-	         // terminate_childrens(), close_connections() and unmap_mem()
+	exit(0); // calling exit(0) produces further calls to
+	         // terminate_children(), close_connections() and unmap_mem()
 }
 
-int kick_client(clients_t *clients, int id)
+int kick_client(sdata_t *sdata, int id)
 {
-	pid_t pid = get_pid_by_id(clients, id);
+	pid_t pid = get_pid_by_id(sdata, id);
 	if(pid == -1)
 		return -1;
 	kill(pid, SIGTERM);
@@ -551,30 +630,30 @@ int get_free_id(struct client *chead)
 
 	for(id=1; chead != NULL; ++id, chead=chead->next)
 	{
-		if(chead->id > id)
+		if(chead->pdata->cid > id)
 			break;
 	}
 
 	return id;
 }
 
-pid_t get_pid_by_id(clients_t *clients, int id)
+pid_t get_pid_by_id(sdata_t *sdata, int id)
 {
-	struct client *c = clients->chead;
+	struct client *c = sdata->chead;
 	while(c) {
-		if(c->id == id)
-			return c->pid;
+		if(c->pdata->cid == id)
+			return c->pdata->pid;
 		c = c->next;
 	}
 	return -1;
 }
 
-int get_id_by_pid(clients_t *clients, pid_t pid)
+int get_id_by_pid(sdata_t *sdata, pid_t pid)
 {
-	struct client *c = clients->chead;
+	struct client *c = sdata->chead;
 	while(c) {
-		if(c->pid == pid)
-			return c->id;
+		if(c->pdata->pid == pid)
+			return c->pdata->cid;
 		c = c->next;
 	}
 	return -1;
@@ -601,95 +680,94 @@ char *get_ip_str(const struct sockaddr *sa, char *s, socklen_t maxlen)
 	return s;
 }
 
-void print_clients(clients_t *clients)
+void print_clients(sdata_t *sdata)
 {
-	struct client *chead = clients->chead;
-	int n = clients->cnt;
+	struct client *chead = sdata->chead;
+	int n = sdata->clients_cnt;
 	printf("\n%d Client%s connected:\n", n, n == 1 ? "":"s");
-	puts("id\tpid\tuptime");
-	while(chead) {
-		printf("%d\t%d\t%lds\n", 
-		       chead->id, chead->pid, time(NULL)-chead->time_join);
-		chead=chead->next;
+	puts("cid\tpid\tuptime");
+	for(chead = sdata->chead; chead != NULL; chead=chead->next)
+	{
+		struct process_data *p = chead->pdata;
+		time_t uptime = time(NULL) - p->time_join;
+		printf("%d\t%d\t%lds\n",
+		       p->cid, p->pid, uptime);
 	}
 	puts("");
 }
 
-void print_uptime(void)
+void print_uptime(sdata_t *sdata)
 {
-	printf("Uptime: %lds\n", time(NULL) - clients->time_up);
+	printf("Uptime: %lds\n", time(NULL) - sdata->time_up);
 }
 
 void print_commands_help(void)
 {
 	puts("Command list:");
-	puts("help ; info ; quit ; uptime ; clients ; "
-	     "stats|status ; say [msg] ; kick [id]");
+	puts("help ; info ; quit ; uptime ; sdata ; "
+	     "stats|status ; say [msg] ; kick [cid]");
 }
 
-int check_id(clients_t *clients, int id)
+int check_id(sdata_t *sdata, int id)
 {
-	struct client *c = clients->chead;
+	struct client *c = sdata->chead;
 	while(c) {
-		if(c->id == id)
+		if(c->pdata->cid == id)
 			return 0;
 		c = c->next;
 	}
 	return -1;
 }
 
-int add_client(clients_t *clients, int sockfd, pid_t pid)
+int add_client(sdata_t *sdata, struct process_data *new_pdata)
 {
-	struct client *new, *aux = clients->chead;
+	struct client *new, *aux = sdata->chead;
+	int id = -1;
 
-	if((size_t)clients->cnt >= MAX_CLIENTS)
-		return (cid = -1);
+	if((size_t)sdata->clients_cnt >= MAX_CLIENTS)
+		return id;
 
+	id = get_free_id(sdata->chead);
 
-	cid = get_free_id(clients->chead);
-
-	size_t mem = (size_t) clients;
-	mem +=	sizeof(clients_t) +
-			sizeof(struct client) * ((size_t)cid-1);
+	size_t mem = (size_t) sdata;
+	mem += sizeof(sdata_t) +
+			sizeof(struct client) * ((size_t)id-1);
 	new = (struct client *) mem;
 
-	new->id = cid;
-	new->pid = pid;
-	new->time_join = time(NULL);
-	new->sockfd = sockfd;
+	new->pdata = new_pdata;
 	new->next = NULL;
 
-	if(aux == NULL || aux->id > 1) {
-		new->next = clients->chead;
-		clients->chead = new;
+	if(aux == NULL || aux->pdata->cid > 1) {
+		new->next = sdata->chead;
+		sdata->chead = new;
 	}
 	else {
-		while(aux->next && aux->next->id < cid)
+		while(aux->next && aux->next->pdata->cid < id) // TODO: simplificar esto plz con un aux_next
 			aux = aux->next;
 		new->next = aux->next;
 		aux->next = new;
 	}
 
-	++clients->cnt;
-	return new->id;
+	++sdata->clients_cnt;
+	return id;
 }
 
-void remove_client(clients_t *clients, int id)
+void remove_client(sdata_t *sdata, int id)
 {
-	struct client *aux = clients->chead;
+	struct client *aux = sdata->chead;
 	struct client *del = NULL;
 	if(aux == NULL)
 		return;
-	if(aux->id == id) {
+	if(aux->pdata->cid == id) {
 		del = aux;
-		clients->chead = aux->next;
-		--clients->cnt;
+		sdata->chead = aux->next;
+		--sdata->clients_cnt;
 	}
 	else while(aux->next) {
-		if(aux->next->id == id) {
+		if(aux->next->pdata->cid == id) { // TODO: simplificar esto plz con un aux_next
 			del = aux->next;
 			aux->next = del->next;
-			--clients->cnt;
+			--sdata->clients_cnt;
 			break;
 		}
 		aux = aux->next;
@@ -700,8 +778,9 @@ void remove_client(clients_t *clients, int id)
 
 size_t getLine(char *buf, int buf_sz)
 {
-	if (fgets(buf, buf_sz, stdin) == NULL)
-		exit(0);
+	if (fgets(buf, buf_sz, stdin) == NULL) {
+		return 0;
+	}
 
 	size_t len = strlen(buf);
 	if(len>0) {
@@ -719,7 +798,7 @@ size_t getLine(char *buf, int buf_sz)
 	return len;
 }
 
-void print_all_messages(clients_t *clients)
+void print_all_messages(sdata_t *clients)
 {
 	struct message *msg = clients->mhead;
 	puts("pending messages:\n");
@@ -729,9 +808,9 @@ void print_all_messages(clients_t *clients)
 	}
 }
 
-struct message *get_message(clients_t *clients, int id)
+struct message *get_message(sdata_t *sdata, int id)
 {
-	struct message *msg = clients->mhead;
+	struct message *msg = sdata->mhead;
 
 	while(msg && msg->sender_id != id)
 		msg = msg->next;
@@ -739,12 +818,12 @@ struct message *get_message(clients_t *clients, int id)
 	return (msg && msg->sender_id == id) ? msg : NULL;
 }
 
-struct message *push_msg(clients_t *clients, char *buf, size_t len, 
+struct message *push_msg(sdata_t *sdata, char *buf, size_t len,
                          int sender_id, int echos)
 {
-	struct message *new, *tail = clients->mhead;
+	struct message *new, *tail = sdata->mhead;
 
-	size_t mem = (size_t) clients->message_mem + 
+	size_t mem = (size_t) sdata->message_mem +
 	             (size_t) sender_id * sizeof(struct message);
 	new = (struct message*) mem;
 	new->msg = buf;
@@ -754,7 +833,7 @@ struct message *push_msg(clients_t *clients, char *buf, size_t len,
 	new->next = NULL;
 
 	if(tail == NULL) {
-		clients->mhead = new;
+		sdata->mhead = new;
 	}
 	else {
 		while(tail->next)
@@ -764,16 +843,16 @@ struct message *push_msg(clients_t *clients, char *buf, size_t len,
 	return new;
 }
 
-void pop_msg(clients_t *clients, int sender_id)
+void pop_msg(sdata_t *sdata, int sender_id)
 {
-	struct message *aux = clients->mhead;
+	struct message *aux = sdata->mhead;
 	struct message *del = aux;
 
 	if(aux == NULL)
 		return;
 
 	if(aux->sender_id == sender_id)
-		clients->mhead = aux->next;
+		sdata->mhead = aux->next;
 
 	else while(aux->next) {
 		if(aux->next->sender_id == sender_id) {
@@ -787,14 +866,19 @@ void pop_msg(clients_t *clients, int sender_id)
 	memset(del, 0, sizeof (struct message));
 }
 
-int send_message(clients_t *clients, msg_type_t concept, 
+struct msg_data {
+	sdata_t *sdata;
+	int sender_id;
+};
+
+int send_message(sdata_t *sdata, msg_type_t concept,
                  char *msg, int sender_id, int dest_id)
 {
-	char *buf = ((char*)clients->message_mem) + MESSAGES_BUF_MEM;
+	char *buf = ((char*)sdata->message_mem) + MESSAGES_BUF_MEM;
 	size_t len = strlen(msg)+1;
-	pid_t dest_pid = get_pid_by_id(clients,dest_id);
+	pid_t dest_pid = get_pid_by_id(sdata, dest_id);
 
-	if(dest_pid == -1 || clients->cnt == 0)
+	if(dest_pid == -1 || sdata->clients_cnt == 0)
 		return -1;
 
 	if(concept == MESSAGE) {
@@ -816,10 +900,11 @@ int send_message(clients_t *clients, msg_type_t concept,
 		memcpy(buf, msg, len);
 	}
 
-	struct message *m = push_msg(clients, buf, len, sender_id, 1);
+	struct message *m = push_msg(sdata, buf, len, sender_id, 1);
 
+	struct msg_data mdata = {sdata, sender_id};
 	union sigval value;
-	value.sival_int = sender_id;
+	value.sival_ptr = &mdata;
 
 	if(sigqueue(dest_pid, SIGUSR1, value) == -1) {
 		perror("sigqueue");
@@ -828,24 +913,24 @@ int send_message(clients_t *clients, msg_type_t concept,
 
 	// Espero a que el mensaje se haya enviado al cliente. No retorno 
 	// inmediatamente así no recibo más comandos hasta que no manejé el actual.
-	while(atomic_load(&m->echos)) {
+	while(atomic_load(&m->echos) > 0) {
 		if(sleep(2) == 0) // sleep(1) doesn't work for this purpose
 			break;        // timeout ~2 seconds reached
 	}
 	int ret = (atomic_load(&m->echos) == 0) ? 0 : -1;
 
-	pop_msg(clients, sender_id);
+	pop_msg(sdata, sender_id);
 	return ret;
 }
 
-int send_echo(clients_t *clients, msg_type_t concept, 
+int send_echo(sdata_t *sdata, msg_type_t concept,
               const char *msg, int sender_id)
 {
-	struct client *chead = clients->chead;
-	char *buf = ((char*)clients->message_mem) + MESSAGES_BUF_MEM;
+	struct client *chead;
+	char *buf = ((char*)sdata->message_mem) + MESSAGES_BUF_MEM;
 	size_t len = strlen(msg)+1;
 
-	if(clients->cnt == 0)
+	if(sdata->clients_cnt == 0)
 		return -1;
 
 	if(concept == MESSAGE) {
@@ -869,51 +954,50 @@ int send_echo(clients_t *clients, msg_type_t concept,
 		memcpy(buf, msg, len);
 	}
 
-	int n_echos = (sender_id == 0) ? clients->cnt : clients->cnt-1;
-	struct message *m = push_msg(clients, buf, len, sender_id, n_echos);
+	int n_echos = (sender_id == 0) ? sdata->clients_cnt : sdata->clients_cnt - 1;
+	struct message *m = push_msg(sdata, buf, len, sender_id, n_echos);
 
+	struct msg_data mdata = {sdata, sender_id};
 	union sigval value;
-	value.sival_int = sender_id;
+	value.sival_ptr = &mdata;
 
-	while(chead)
+	for(chead = sdata->chead; chead != NULL; chead = chead->next)
 	{
-		if(chead->id != sender_id)
+		if(chead->pdata->cid != sender_id)
 		{
-			if(sigqueue(chead->pid, SIGUSR1, value) == -1) {
+			if(sigqueue(chead->pdata->pid, SIGUSR1, value) == -1)
 				perror("sigqueue");
-			}
 		}
-		chead = chead->next;
 	}
 
 	// Espero a que el mensaje se haya enviado a todos los clientes. No retorno
 	// inmediatamente así no recibo más mensajes hasta que no manejé el actual.
-	while(atomic_load(&m->echos)) {
+	while(atomic_load(&m->echos) > 0) {
 		if(sleep(2) == 0) // sleep(1) doesn't work for this purpose
 			break;        // timeout ~2 seconds reached
 	}
 	int ret = (atomic_load(&m->echos) == 0) ? 0 : -1;
 
-	pop_msg(clients, sender_id);
+	pop_msg(sdata, sender_id);
 	return ret;
 }
 
 static void sigusr1_handler(int signal, siginfo_t *info, void *ucontext)
 {
 	(void)signal; (void)ucontext;
-	int sender_id = info->si_value.sival_int;
+	struct msg_data *mdata = info->si_value.sival_ptr;
 
-	struct message *msg = get_message(clients, sender_id);
+	struct message *msg = get_message(mdata->sdata, mdata->sender_id);
 	if(msg == NULL) {
 		fputs("Unable to echo msg.\n", stderr);
 		return;
 	}
 
 	char *buf = msg->msg;
-	size_t len = msg->lenght;
+	int len = (int) msg->lenght;
 
 	//ssize_t ret = send(cfd, buf, len, MSG_DONTWAIT);
-	ssize_t ret = SSL_write(ssl, buf, len); 
+	ssize_t ret = SSL_write(pdata.ssl, buf, len);
 	// TODO: evaluate how to use MSG_DONTWAIT flag with fcntl(fd)
 	if(ret <= 0) {
 		perror("SSL_write");
@@ -929,12 +1013,12 @@ void sleep_ms(int ms)
 {
 	struct timespec tim, rem;
 	tim.tv_sec = ms / 1000;
-	tim.tv_nsec = (ms % 1000) * 1E6;
+	tim.tv_nsec = (ms % 1000) * 1000000;
 
 	if(nanosleep(&tim , &rem) == -1)
 	{
 		if (errno == EINTR)
-			sleep_ms(rem.tv_sec*1000 + rem.tv_nsec/1E6);
+			sleep_ms(rem.tv_sec*1000 + rem.tv_nsec/1000000);
 		
 		else
 			perror("nanosleep");
