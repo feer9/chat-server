@@ -70,6 +70,33 @@ typedef struct {
 #define GENERATE_ENUM(ENUM) cmd_##ENUM,
 #define GENERATE_STRING(STRING) #STRING,
 
+// Here I define the list of available commands, which then generates
+// an enum of the form cmd_<commandname> and a string "<commandname>"
+#define COMMAND_LIST(CMD)	\
+	CMD(quit)				\
+	CMD(kick)				\
+	CMD(say)				\
+	CMD(clients)			\
+	CMD(uptime)				\
+	CMD(stats)				\
+	CMD(status)				\
+	CMD(help)				\
+	CMD(info)
+
+typedef enum {
+	COMMAND_LIST(GENERATE_ENUM)
+	cmd_CONTINUE,
+	cmd_MAX
+} commands_e;
+
+typedef struct {
+	commands_e id;
+	const char *str;
+	const char *arg;
+} command_t;
+
+
+
 #define MIN(a,b) ((a<b) ? a : b)
 
 #define MAX_CLIENTS MIN(((CLIENTS_MEM_SZ-sizeof(sdata_t)) / sizeof(struct client) - 1) , \
@@ -83,41 +110,42 @@ typedef struct {
 #define dbg_print_safe(s) while(0) continue
 #endif
 
-int create_socket(void);
 void set_signals(sdata_t *sdata);
+command_t* readCmd(sdata_t *sdata);
+void handle_readerr(sdata_t *sdata);
 void console(sdata_t *sdata);
+int cmd_KickUser(sdata_t *sdata, int user_id);
+int cmd_KickUser_s(sdata_t *sdata, const char *id_str);
+void print_clients(sdata_t *sdata);
+void print_uptime(sdata_t *sdata);
+void print_commands_help(void);
+size_t getLine(char *buf, int buf_sz);
+void *thread_listen(void *data);
+int create_socket(void);
+char *get_ip_str(const struct sockaddr *sa, char *s, socklen_t maxlen);
+int kick_client(sdata_t *sdata, int id);
 int get_free_id(struct client *chead);
 pid_t get_pid_by_id(sdata_t *sdata, int id);
 int get_id_by_pid(sdata_t *sdata, int id);
-void print_clients(sdata_t *sdata);
-void print_commands_help(void);
-void print_uptime(sdata_t *sdata);
-int add_client(sdata_t *sdata, struct process_data*);
 int check_id(sdata_t *sdata, int id);
+int add_client(sdata_t *sdata, struct process_data*);
 void remove_client(sdata_t *sdata, int id);
-int kick_client(sdata_t *sdata, int id);
-int cmd_KickUser(sdata_t *sdata, int user_id);
-int cmd_KickUser_s(sdata_t *sdata, const char *id_str);
-void close_connections(int status, void* data);
-void terminate_children(int status, void* data);
-void exit_program(int signal);
+struct message *get_message(sdata_t *sdata, int id);
+struct message *push_msg(sdata_t *sdata, char *buf, size_t len, int sender_id, int echos);
+void pop_msg(sdata_t *sdata, int sender_id);
+int send_message(sdata_t *sdata, msg_type_t concept, char *buf, int sender_id, int dest_id);
+int send_echo(sdata_t *sdata, msg_type_t concept, const char *buf, int sender_id);
+static void sigusr1_handler(int signal, siginfo_t *info, void *ucontext);
+static void dummy_handler(int s);
+static void sigchld_handler(int signal);
+static void sigpipe_handler(int signal);
 void* create_shared_memory(size_t size);
 void unmap_mem(int status, void* data);
-size_t getLine(char *buf, int buf_sz);
-void handle_readerr(sdata_t *sdata);
-void *thread_listen(void *data);
+void close_connections(int status, void* data);
 void report_socket_down(sdata_t *sdata);
 void wait_for_child(sdata_t *sdata);
-static void sigusr1_handler(int signal, siginfo_t *info, void *ucontext);
-static void sigpipe_handler(int signal);
-static void sigchld_handler(int signal);
-static void dummy_handler(int s);
-int send_echo(sdata_t *sdata, msg_type_t concept, const char *buf, int sender_id);
-int send_message(sdata_t *sdata, msg_type_t concept, char *buf, int sender_id, int dest_id);
-void pop_msg(sdata_t *sdata, int sender_id);
-struct message *push_msg(sdata_t *sdata, char *buf, size_t len, int sender_id, int echos);
-struct message *get_message(sdata_t *sdata, int id);
-char *get_ip_str(const struct sockaddr *sa, char *s, socklen_t maxlen);
+void terminate_children(int status, void* data);
+void exit_program(int signal);
 void sleep_ms(int ms);
 
 void initialize_openssl(void);

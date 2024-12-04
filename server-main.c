@@ -13,6 +13,7 @@ static struct process_data pdata = {
 static volatile sig_atomic_t sigchld_received = 0;
 static volatile sig_atomic_t sigpipe_received = 0;
 
+/* FIXME: estoy pisando sdata->chead->pdata con los datos del main thread en vez de dejar ahi lo de los children */
 int main(int argc, char *argv[])
 {
 	static sdata_t *sdata;
@@ -42,35 +43,54 @@ int main(int argc, char *argv[])
 	exit(0);
 }
 
-// Here I define the list of available commands, which then generates
-// an enum of the form cmd_<commandname> and a string "<commandname>"
-#define COMMAND_LIST(CMD)	\
-	CMD(quit)				\
-	CMD(kick)				\
-	CMD(say)				\
-	CMD(clients)			\
-	CMD(uptime)				\
-	CMD(stats)				\
-	CMD(status)				\
-	CMD(help)				\
-	CMD(info)
+static void set_signal_handler(int signum, const struct sigaction *sa)
+{
+	if (sigaction(signum, sa, NULL) == -1) {
+		perror("sigaction");
+		exit(1);
+	}
+}
 
-typedef enum {
-	COMMAND_LIST(GENERATE_ENUM)
-	cmd_CONTINUE,
-	cmd_MAX
-} commands_e;
+void set_signals(sdata_t *sdata)
+{
+	struct sigaction sa;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+
+	sa.sa_handler = sigpipe_handler;
+	set_signal_handler(SIGPIPE, &sa);
+
+	sa.sa_handler = sigchld_handler;
+	set_signal_handler(SIGCHLD, &sa);
+
+	sa.sa_flags |= SA_RESTART;
+	sa.sa_handler = exit_program;
+	set_signal_handler(SIGTERM, &sa);
+	set_signal_handler(SIGINT, &sa);
+
+	sa.sa_handler = dummy_handler;
+	sa.sa_flags |= SA_NODEFER;
+	/* Do not add the signal to the thread's signal mask  while the handler  is
+	 * executing, unless the signal is specified in act.sa_mask.  Consequently,
+     * a  further  instance  of the signal may be delivered to the thread while
+     * it is executing the handler.
+     */
+	set_signal_handler(SIGCONT, &sa);
+
+	sa.sa_flags |= SA_SIGINFO;
+	/* TODO: Check the usage of SA_NODEFER flag here, it may be wrong */
+	sa.sa_sigaction = &sigusr1_handler;
+	set_signal_handler(SIGUSR1, &sa);
+
+	on_exit(unmap_mem, sdata);           // 3°
+	on_exit(close_connections, sdata);   // 2°
+	on_exit(terminate_children, sdata);  // 1°
+}
 
 static const char *commands_string[] = {
     COMMAND_LIST(GENERATE_STRING)
 	"", /* cmd_CONTINUE */
 };
-
-typedef struct {
-	commands_e id;
-	const char *str;
-	const char *arg;
-} command_t;
 
 static int compare_cmd(const void *a, const void *b)
 {
@@ -90,7 +110,7 @@ static void init_commands(command_t *commands)
 
 static command_t commands[cmd_MAX];
 
-static command_t* readCmd(sdata_t *sdata)
+command_t* readCmd(sdata_t *sdata)
 {
 	static char buf[64] = "";
 	static command_t input_cmd;
@@ -113,7 +133,7 @@ static command_t* readCmd(sdata_t *sdata)
 	// get command ID
 	input_cmd.str = buf;
 	input_cmd.arg = NULL;
-	command_t *cmd_ptr = bsearch(&input_cmd, commands, cmd_MAX, 
+	command_t *cmd_ptr = bsearch(&input_cmd, commands, cmd_MAX,
 	                             sizeof *commands, compare_cmd);
 
 	if(cmd_ptr) { // command found
@@ -240,6 +260,56 @@ int cmd_KickUser_s(sdata_t *sdata, const char *id_str)
 		return -1;
 	}
 	else return cmd_KickUser(sdata, user_id);
+}
+
+void print_clients(sdata_t *sdata)
+{
+	struct client *chead = sdata->chead;
+	int n = sdata->clients_cnt;
+	printf("\n%d Client%s connected:\n", n, n == 1 ? "":"s");
+	puts("cid\tpid\tuptime");
+	for(chead = sdata->chead; chead != NULL; chead=chead->next)
+	{
+		struct process_data *p = chead->pdata;
+		time_t uptime = time(NULL) - p->time_join;
+		printf("%d\t%d\t%lds\n",
+		       p->cid, p->pid, uptime);
+	}
+	puts("");
+}
+
+void print_uptime(sdata_t *sdata)
+{
+	printf("Uptime: %lds\n", time(NULL) - sdata->time_up);
+}
+
+void print_commands_help(void)
+{
+	puts("Command list:");
+	puts("help ; info ; quit ; uptime ; sdata ; "
+	     "stats|status ; say [msg] ; kick [cid]");
+}
+
+size_t getLine(char *buf, int buf_sz)
+{
+	if (fgets(buf, buf_sz, stdin) == NULL) {
+		return 0;
+	}
+
+	size_t len = strlen(buf);
+	if(len>0) {
+		buf[--len] = '\0';
+
+		if((int)len == buf_sz-1) {
+			// Input bigger than buffer. Clean stdin
+			int c;
+			do {
+				c = getchar();
+			} while (c != '\n' && c != EOF);
+		}
+	}
+
+	return len;
 }
 
 void *thread_listen(void *data) // TODO: split into functions
@@ -426,193 +496,25 @@ int create_socket(void)
 	return sockfd;
 }
 
-static void set_signal_handler(int signum, const struct sigaction *sa)
+char *get_ip_str(const struct sockaddr *sa, char *s, socklen_t maxlen)
 {
-	if (sigaction(signum, sa, NULL) == -1) {
-		perror("sigaction");
-		exit(1);
+	switch(sa->sa_family) {
+		case AF_INET:
+			inet_ntop(AF_INET, &(((const struct sockaddr_in *)sa)->sin_addr)
+					, s, maxlen);
+			break;
+
+		case AF_INET6:
+			inet_ntop(AF_INET6, &(((const struct sockaddr_in6 *)sa)->sin6_addr)
+					, s, maxlen);
+			break;
+
+		default:
+			strncpy(s, "Unknown AF", maxlen);
+			return NULL;
 	}
-}
 
-void set_signals(sdata_t *sdata)
-{
-	struct sigaction sa;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-
-	sa.sa_handler = sigpipe_handler;
-	set_signal_handler(SIGPIPE, &sa);
-
-	sa.sa_handler = sigchld_handler;
-	set_signal_handler(SIGCHLD, &sa);
-
-	sa.sa_flags |= SA_RESTART;
-	sa.sa_handler = exit_program;
-	set_signal_handler(SIGTERM, &sa);
-	set_signal_handler(SIGINT, &sa);
-
-	sa.sa_handler = dummy_handler;
-	sa.sa_flags |= SA_NODEFER;
-	/* Do not add the signal to the thread's signal mask  while the handler  is
-	 * executing, unless the signal is specified in act.sa_mask.  Consequently,
-     * a  further  instance  of the signal may be delivered to the thread while
-     * it is executing the handler.
-     */
-	set_signal_handler(SIGCONT, &sa);
-
-	sa.sa_flags |= SA_SIGINFO;
-	/* TODO: Check the usage of SA_NODEFER flag here, it may be wrong */
-	sa.sa_sigaction = &sigusr1_handler;
-	set_signal_handler(SIGUSR1, &sa);
-
-	on_exit(unmap_mem, sdata);           // 3°
-	on_exit(close_connections, sdata);   // 2°
-	on_exit(terminate_children, sdata);  // 1°
-}
-
-void* create_shared_memory(size_t size) {
-  // Our memory buffer will be readable and writable:
-  int protection = PROT_READ | PROT_WRITE;
-
-  // The buffer will be shared (meaning other processes can access it), but
-  // anonymous (meaning third-party processes cannot obtain an address for it),
-  // so only this process and its children will be able to use it:
-  int visibility = MAP_SHARED | MAP_ANONYMOUS;
-
-  // The remaining parameters to `mmap()` are not important for this use case,
-  // but the manpage for `mmap` explains their purpose.
-  return mmap(NULL, size, protection, visibility, -1, 0);
-}
-
-void unmap_mem(int status, void* data)
-{
-	sdata_t *sdata = data;
-	if(pdata.cid == 0) // only parent executes this code
-	{
-		write(1, "Unmapping shared memory...", 26);
-		if(sdata) {
-			if(sdata->message_mem) {
-				munmap(sdata->message_mem, MESSAGES_MEM_SZ);
-			}
-			munmap(sdata, CLIENTS_MEM_SZ);
-			sdata = NULL;
-		}
-		write(1," done.\n", 7);
-	}
-}
-
-static void sigchld_handler(int signal)
-{
-	(void) signal;
-//	wait_for_child(sdata);
-	sigchld_received++;
-}
-
-//__attribute__((__noreturn__))
-static void sigpipe_handler(int signal)
-{
-	(void)signal;
-	sigpipe_received=1;
-//	report_socket_down(sdata);
-//	exit(0);
-}
-
-void close_connections(int status, void* data)
-{
-//	sdata_t *sdata = data; // server data
-	struct process_data *p = &pdata; // process data
-
-	if(pdata.cid == 0) // parent
-	{
-		if(p->sockfd != -1) { // 3
-			close(p->sockfd);
-			p->sockfd = -1;
-		}
-	}
-	else // childrens
-	{
-		if(p->ssl != NULL) { // 1
-			if(SSL_shutdown(p->ssl) == 0){
-			//	shutdown(sockfd, SHUT_WR);
-				sleep_ms(50);
-				SSL_shutdown(p->ssl);
-			}
-			SSL_free(p->ssl);
-			p->ssl = NULL;
-		}
-		if(p->sockfd != -1) { // 2
-			close(p->sockfd);
-			p->sockfd = -1;
-		}
-		if(p->ssl_ctx != NULL) { // 4
-			SSL_CTX_free(p->ssl_ctx);
-			p->ssl_ctx = NULL;
-		}
-		cleanup_openssl();
-	}
-	// TODO: no tendrían que ejecutar todos lo mismo? creo q el parent también tiene un SSL_CTX
-}
-
-void report_socket_down(sdata_t *sdata)
-{
-	int client_id = pdata.cid;
-	char* buf = (char*) sdata->message_mem + MESSAGES_BUF_MEM;
-	sprintf(buf, "Client %d disconnected.", client_id);
-
-	puts(buf);
-	send_echo(sdata, INFO, buf, client_id);
-}
-
-void wait_for_child(sdata_t *sdata)
-{
-	pid_t terminated_pid = wait(NULL);
-
-	if(terminated_pid > 0) {
-		int id = get_id_by_pid(sdata, terminated_pid);
-		dbg_print("in wait_for_child(): removing client %d\n", id);
-		remove_client(sdata, id);
-	}
-	else {
-		perror("wait");
-		exit(1); // is it an error? TODO: test with SIGSTOP
-	}
-}
-
-void terminate_children(int status, void* data)
-{
-	sdata_t *sdata = data; // server data
-	struct process_data *p = &pdata; // process data
-
-	if(p->cid == 0) // only parent executes this code
-	{
-		write(1,"Terminating all child processes...", 34);
-
-		// Disable SIGCHLD signal
-		sigset_t set;
-		sigemptyset(&set);
-		sigaddset(&set, SIGCHLD);
-		pthread_sigmask(SIG_BLOCK, &set, NULL);
-
-		// Signal all children to terminate
-		struct client *chead;
-		for(chead = sdata->chead; chead != NULL; chead = chead->next)
-			kill(chead->pdata->pid, SIGTERM);
-
-		// Wait for all children termination
-		while(sdata->chead != NULL) {
-			sigchld_handler(0);
-		}
-		write(1, " done.\n", 7);
-	}
-}
-
-__attribute__((__noreturn__))
-void exit_program(int signal)
-{
-	(void)signal; // may be SIGTERM or SIGINT
-
-	exit(0); // calling exit(0) produces further calls to
-	         // terminate_children(), close_connections() and unmap_mem()
+	return s;
 }
 
 int kick_client(sdata_t *sdata, int id)
@@ -657,55 +559,6 @@ int get_id_by_pid(sdata_t *sdata, pid_t pid)
 		c = c->next;
 	}
 	return -1;
-}
-
-char *get_ip_str(const struct sockaddr *sa, char *s, socklen_t maxlen)
-{
-	switch(sa->sa_family) {
-		case AF_INET:
-	        inet_ntop(AF_INET, &(((const struct sockaddr_in *)sa)->sin_addr)
-			          , s, maxlen);
-			break;
-
-		case AF_INET6:
-	        inet_ntop(AF_INET6, &(((const struct sockaddr_in6 *)sa)->sin6_addr)
-			          , s, maxlen);
-			break;
-
-		default:
-			strncpy(s, "Unknown AF", maxlen);
-			return NULL;
-	}
-
-	return s;
-}
-
-void print_clients(sdata_t *sdata)
-{
-	struct client *chead = sdata->chead;
-	int n = sdata->clients_cnt;
-	printf("\n%d Client%s connected:\n", n, n == 1 ? "":"s");
-	puts("cid\tpid\tuptime");
-	for(chead = sdata->chead; chead != NULL; chead=chead->next)
-	{
-		struct process_data *p = chead->pdata;
-		time_t uptime = time(NULL) - p->time_join;
-		printf("%d\t%d\t%lds\n",
-		       p->cid, p->pid, uptime);
-	}
-	puts("");
-}
-
-void print_uptime(sdata_t *sdata)
-{
-	printf("Uptime: %lds\n", time(NULL) - sdata->time_up);
-}
-
-void print_commands_help(void)
-{
-	puts("Command list:");
-	puts("help ; info ; quit ; uptime ; sdata ; "
-	     "stats|status ; say [msg] ; kick [cid]");
 }
 
 int check_id(sdata_t *sdata, int id)
@@ -774,28 +627,6 @@ void remove_client(sdata_t *sdata, int id)
 	}
 	if(del)
 		memset(del, 0, sizeof (struct client));
-}
-
-size_t getLine(char *buf, int buf_sz)
-{
-	if (fgets(buf, buf_sz, stdin) == NULL) {
-		return 0;
-	}
-
-	size_t len = strlen(buf);
-	if(len>0) {
-		buf[--len] = '\0';
-
-		if((int)len == buf_sz-1) {
-			// Input bigger than buffer. Clean stdin
-			int c;
-			do {
-				c = getchar();
-			} while (c != '\n' && c != EOF);
-		}
-	}
-
-	return len;
 }
 
 void print_all_messages(sdata_t *clients)
@@ -911,7 +742,7 @@ int send_message(sdata_t *sdata, msg_type_t concept,
 		return -1;
 	}
 
-	// Espero a que el mensaje se haya enviado al cliente. No retorno 
+	// Espero a que el mensaje se haya enviado al cliente. No retorno
 	// inmediatamente así no recibo más comandos hasta que no manejé el actual.
 	while(atomic_load(&m->echos) > 0) {
 		if(sleep(2) == 0) // sleep(1) doesn't work for this purpose
@@ -1009,6 +840,151 @@ static void sigusr1_handler(int signal, siginfo_t *info, void *ucontext)
 
 static void dummy_handler(int s){(void)s;}
 
+static void sigchld_handler(int signal)
+{
+	(void) signal;
+//	wait_for_child(sdata);
+	sigchld_received++;
+}
+
+//__attribute__((__noreturn__))
+static void sigpipe_handler(int signal)
+{
+	(void)signal;
+	sigpipe_received=1;
+//	report_socket_down(sdata);
+//	exit(0);
+}
+
+void* create_shared_memory(size_t size) {
+  // Our memory buffer will be readable and writable:
+  int protection = PROT_READ | PROT_WRITE;
+
+  // The buffer will be shared (meaning other processes can access it), but
+  // anonymous (meaning third-party processes cannot obtain an address for it),
+  // so only this process and its children will be able to use it:
+  int visibility = MAP_SHARED | MAP_ANONYMOUS;
+
+  // The remaining parameters to `mmap()` are not important for this use case,
+  // but the manpage for `mmap` explains their purpose.
+  return mmap(NULL, size, protection, visibility, -1, 0);
+}
+
+void unmap_mem(int status, void* data)
+{
+	sdata_t *sdata = data;
+	if(pdata.cid == 0) // only parent executes this code
+	{
+		write(1, "Unmapping shared memory...", 26);
+		if(sdata) {
+			if(sdata->message_mem) {
+				munmap(sdata->message_mem, MESSAGES_MEM_SZ);
+			}
+			munmap(sdata, CLIENTS_MEM_SZ);
+			sdata = NULL;
+		}
+		write(1," done.\n", 7);
+	}
+}
+
+void close_connections(int status, void* data)
+{
+//	sdata_t *sdata = data; // server data
+	struct process_data *p = &pdata; // process data
+
+	if(pdata.cid == 0) // parent
+	{
+		if(p->sockfd != -1) { // 3
+			close(p->sockfd);
+			p->sockfd = -1;
+		}
+	}
+	else // childrens
+	{
+		if(p->ssl != NULL) { // 1
+			if(SSL_shutdown(p->ssl) == 0){
+			//	shutdown(sockfd, SHUT_WR);
+				sleep_ms(50);
+				SSL_shutdown(p->ssl);
+			}
+			SSL_free(p->ssl);
+			p->ssl = NULL;
+		}
+		if(p->sockfd != -1) { // 2
+			close(p->sockfd);
+			p->sockfd = -1;
+		}
+		if(p->ssl_ctx != NULL) { // 4
+			SSL_CTX_free(p->ssl_ctx);
+			p->ssl_ctx = NULL;
+		}
+		cleanup_openssl();
+	}
+	// TODO: no tendrían que ejecutar todos lo mismo? creo q el parent también tiene un SSL_CTX
+}
+
+void report_socket_down(sdata_t *sdata)
+{
+	int client_id = pdata.cid;
+	char* buf = (char*) sdata->message_mem + MESSAGES_BUF_MEM;
+	sprintf(buf, "Client %d disconnected.", client_id);
+
+	puts(buf);
+	send_echo(sdata, INFO, buf, client_id);
+}
+
+void wait_for_child(sdata_t *sdata)
+{
+	pid_t terminated_pid = wait(NULL);
+
+	if(terminated_pid > 0) {
+		int id = get_id_by_pid(sdata, terminated_pid);
+		dbg_print("in wait_for_child(): removing client %d\n", id);
+		remove_client(sdata, id);
+	}
+	else {
+		perror("wait");
+		exit(1); // is it an error? TODO: test with SIGSTOP
+	}
+}
+
+void terminate_children(int status, void* data)
+{
+	sdata_t *sdata = data; // server data
+	struct process_data *p = &pdata; // process data
+
+	if(p->cid == 0) // only parent executes this code
+	{
+		write(1,"Terminating all child processes...", 34);
+
+		// Disable SIGCHLD signal
+		sigset_t set;
+		sigemptyset(&set);
+		sigaddset(&set, SIGCHLD);
+		pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+		// Signal all children to terminate
+		struct client *chead;
+		for(chead = sdata->chead; chead != NULL; chead = chead->next)
+			kill(chead->pdata->pid, SIGTERM);
+
+		// Wait for all children termination
+		while(sdata->chead != NULL) {
+			sigchld_handler(0);
+		}
+		write(1, " done.\n", 7);
+	}
+}
+
+__attribute__((__noreturn__))
+void exit_program(int signal)
+{
+	(void)signal; // may be SIGTERM or SIGINT
+
+	exit(0); // calling exit(0) produces further calls to
+	         // terminate_children(), close_connections() and unmap_mem()
+}
+
 void sleep_ms(int ms)
 {
 	struct timespec tim, rem;
@@ -1019,7 +995,7 @@ void sleep_ms(int ms)
 	{
 		if (errno == EINTR)
 			sleep_ms(rem.tv_sec*1000 + rem.tv_nsec/1000000);
-		
+
 		else
 			perror("nanosleep");
 	}
@@ -1060,7 +1036,7 @@ void configure_ssl_context(SSL_CTX *ctx) {
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -sha256 -days 365
 
 # non-interactive and 10 years expiration
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -sha256 
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -sha256
 -days 3650 -nodes -subj "/C=XX/ST=StateName/L=CityName/O=CompanyName/OU=Company
 SectionName/CN=CommonNameOrHostname"
 */
